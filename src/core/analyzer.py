@@ -158,6 +158,12 @@ class CodeAnalyzer:
         if self._tool_available('golint'):
             analyzers['go_lint'] = 'golint'
         
+        if self._tool_available('ansible-lint'):
+            analyzers['ansible_lint'] = 'ansible-lint'
+        
+        if self._tool_available('yamllint'):
+            analyzers['yaml_lint'] = 'yamllint'
+        
         return analyzers
     
     def _tool_available(self, tool_name: str) -> bool:
@@ -346,6 +352,14 @@ class CodeAnalyzer:
         if language == 'python' and 'python_security' in self.analyzers:
             tool_issues = self._run_bandit(file_path)
             issues.extend(tool_issues)
+        elif language == 'yaml':
+            yaml_security_issues = self._analyze_yaml_security(file_path)
+            issues.extend(yaml_security_issues)
+            
+            # Run additional YAML tools if available
+            if 'ansible_lint' in self.analyzers and self._is_ansible_file(file_path, open(file_path).read()):
+                ansible_issues = self._run_ansible_lint(file_path)
+                issues.extend(ansible_issues)
         
         return issues
     
@@ -360,6 +374,13 @@ class CodeAnalyzer:
             issues.extend(self._analyze_js_quality(file_path))
         elif language == 'java':
             issues.extend(self._analyze_java_quality(file_path))
+        elif language == 'yaml':
+            issues.extend(self._analyze_yaml_quality(file_path))
+            
+            # Run YAML linting tools if available
+            if 'yaml_lint' in self.analyzers:
+                yaml_issues = self._run_yamllint(file_path)
+                issues.extend(yaml_issues)
         
         return issues
     
@@ -372,6 +393,8 @@ class CodeAnalyzer:
             issues.extend(self._analyze_python_performance(file_path))
         elif language in ['javascript', 'typescript']:
             issues.extend(self._analyze_js_performance(file_path))
+        elif language == 'yaml':
+            issues.extend(self._analyze_yaml_performance(file_path))
         
         return issues
     
@@ -408,6 +431,99 @@ class CodeAnalyzer:
             self.logger.warning(f"Bandit analysis failed for {file_path}: {e}")
         
         return issues
+    
+    def _run_ansible_lint(self, file_path: str) -> List[Dict[str, Any]]:
+        """Run ansible-lint on Ansible YAML files."""
+        issues = []
+        
+        try:
+            cmd = ['ansible-lint', '-f', 'json', file_path]
+            result = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+            
+            if result.returncode != 0 and result.stdout:
+                try:
+                    lint_output = json.loads(result.stdout)
+                    for issue in lint_output:
+                        issues.append({
+                            'category': 'quality',
+                            'type': f"ansible_lint_{issue.get('tag', 'unknown')}",
+                            'severity': self._map_ansible_lint_severity(issue.get('level', 'warning')),
+                            'description': issue.get('message', 'Ansible lint issue'),
+                            'line': issue.get('linenumber', 0),
+                            'code': '',
+                            'tool': 'ansible-lint',
+                            'rule': issue.get('tag', '')
+                        })
+                except json.JSONDecodeError:
+                    # Fallback to parsing text output
+                    for line in result.stdout.split('\n'):
+                        if ':' in line and any(severity in line.lower() for severity in ['error', 'warning']):
+                            issues.append({
+                                'category': 'quality',
+                                'type': 'ansible_lint_issue',
+                                'severity': 'medium',
+                                'description': line.strip(),
+                                'line': 0,
+                                'code': '',
+                                'tool': 'ansible-lint'
+                            })
+        
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            self.logger.warning(f"Ansible-lint analysis failed for {file_path}: {e}")
+        
+        return issues
+    
+    def _run_yamllint(self, file_path: str) -> List[Dict[str, Any]]:
+        """Run yamllint on YAML files."""
+        issues = []
+        
+        try:
+            cmd = ['yamllint', '-f', 'json', file_path]
+            result = subprocess.run(cmd, capture_output=True, timeout=30, text=True)
+            
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        try:
+                            issue = json.loads(line)
+                            issues.append({
+                                'category': 'quality',
+                                'type': f"yaml_lint_{issue.get('type', 'unknown')}",
+                                'severity': self._map_yamllint_severity(issue.get('level', 'warning')),
+                                'description': issue.get('desc', 'YAML lint issue'),
+                                'line': issue.get('line', 0),
+                                'code': '',
+                                'tool': 'yamllint',
+                                'rule': issue.get('rule', '')
+                            })
+                        except json.JSONDecodeError:
+                            continue
+        
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            self.logger.warning(f"Yamllint analysis failed for {file_path}: {e}")
+        
+        return issues
+    
+    def _map_ansible_lint_severity(self, level: str) -> str:
+        """Map ansible-lint severity levels to our standard levels."""
+        mapping = {
+            'very_high': 'high',
+            'high': 'high',
+            'medium': 'medium',
+            'low': 'low',
+            'very_low': 'low',
+            'info': 'low'
+        }
+        return mapping.get(level.lower(), 'medium')
+    
+    def _map_yamllint_severity(self, level: str) -> str:
+        """Map yamllint severity levels to our standard levels."""
+        mapping = {
+            'error': 'high',
+            'warning': 'medium',
+            'info': 'low'
+        }
+        return mapping.get(level.lower(), 'medium')
     
     def _analyze_python_quality(self, file_path: str) -> List[Dict[str, Any]]:
         """Analyze Python file for quality issues."""
@@ -633,6 +749,374 @@ class CodeAnalyzer:
         
         except Exception as e:
             self.logger.warning(f"JavaScript performance analysis failed for {file_path}: {e}")
+        
+        return issues
+    
+    def _analyze_yaml_security(self, file_path: str) -> List[Dict[str, Any]]:
+        """Analyze YAML file for security issues, especially Ansible-specific ones."""
+        issues = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            lines = content.split('\n')
+            is_ansible = self._is_ansible_file(file_path, content)
+            
+            for i, line in enumerate(lines, 1):
+                # General YAML security issues
+                
+                # Check for hardcoded secrets
+                if re.search(r'(password|secret|key|token|api_key):\s*["\']?[a-zA-Z0-9_\-+=\/]{8,}["\']?', line, re.IGNORECASE):
+                    issues.append({
+                        'category': 'security',
+                        'type': 'hardcoded_secret',
+                        'severity': 'high',
+                        'description': 'Hardcoded secret or credential detected',
+                        'line': i,
+                        'code': line.strip(),
+                        'tool': 'yaml_security_analysis'
+                    })
+                
+                # Check for URLs with credentials
+                if re.search(r'https?://[^:]+:[^@]+@', line):
+                    issues.append({
+                        'category': 'security',
+                        'type': 'url_with_credentials',
+                        'severity': 'high',
+                        'description': 'URL contains embedded credentials',
+                        'line': i,
+                        'code': line.strip(),
+                        'tool': 'yaml_security_analysis'
+                    })
+                
+                # Ansible-specific security checks
+                if is_ansible:
+                    # Check for shell commands with user input
+                    if re.search(r'(shell|command):', line):
+                        if '{{' in line and any(unsafe in line.lower() for unsafe in ['user_input', 'ansible_user', 'item']):
+                            issues.append({
+                                'category': 'security',
+                                'type': 'ansible_shell_injection',
+                                'severity': 'high',
+                                'description': 'Potential shell injection via unescaped user input',
+                                'line': i,
+                                'code': line.strip(),
+                                'tool': 'ansible_security_analysis'
+                            })
+                    
+                    # Check for privilege escalation without become
+                    if re.search(r'(shell|command):.*sudo', line) and 'become:' not in content:
+                        issues.append({
+                            'category': 'security',
+                            'type': 'ansible_unsafe_sudo',
+                            'severity': 'medium',
+                            'description': 'Use become instead of sudo in shell commands',
+                            'line': i,
+                            'code': line.strip(),
+                            'tool': 'ansible_security_analysis'
+                        })
+                    
+                    # Check for file permissions issues
+                    if 'mode:' in line:
+                        mode_match = re.search(r'mode:\s*["\']?(\d+)["\']?', line)
+                        if mode_match:
+                            mode = mode_match.group(1)
+                            if len(mode) == 3 and mode.endswith('7'):  # World writable
+                                issues.append({
+                                    'category': 'security',
+                                    'type': 'ansible_world_writable',
+                                    'severity': 'medium',
+                                    'description': 'File/directory is world-writable, consider restricting permissions',
+                                    'line': i,
+                                    'code': line.strip(),
+                                    'tool': 'ansible_security_analysis'
+                                })
+                    
+                    # Check for unsafe file operations
+                    if 'src:' in line and '{{' in line:
+                        if not re.search(r'\|\s*quote', line):  # No quote filter
+                            issues.append({
+                                'category': 'security',
+                                'type': 'ansible_unquoted_src',
+                                'severity': 'medium',
+                                'description': 'Use quote filter for dynamic file paths to prevent injection',
+                                'line': i,
+                                'code': line.strip(),
+                                'tool': 'ansible_security_analysis'
+                            })
+                    
+                    # Check for debug tasks that might leak sensitive info
+                    if 'debug:' in line and ('var:' in line or 'msg:' in line):
+                        if any(sensitive in line.lower() for sensitive in ['password', 'secret', 'key', 'token']):
+                            issues.append({
+                                'category': 'security',
+                                'type': 'ansible_debug_sensitive',
+                                'severity': 'medium',
+                                'description': 'Debug statement might expose sensitive information',
+                                'line': i,
+                                'code': line.strip(),
+                                'tool': 'ansible_security_analysis'
+                            })
+                    
+                    # Check for missing no_log on sensitive tasks
+                    if any(module in line for module in ['user:', 'mysql_user:', 'postgresql_user:']):
+                        if 'password' in line and 'no_log:' not in content[max(0, content.rfind('\n', 0, content.find(line))):content.find(line) + len(line) + 200]:
+                            issues.append({
+                                'category': 'security',
+                                'type': 'ansible_missing_no_log',
+                                'severity': 'high',
+                                'description': 'Tasks with passwords should use no_log: true',
+                                'line': i,
+                                'code': line.strip(),
+                                'tool': 'ansible_security_analysis'
+                            })
+        
+        except Exception as e:
+            self.logger.warning(f"YAML security analysis failed for {file_path}: {e}")
+        
+        return issues
+    
+    def _analyze_yaml_quality(self, file_path: str) -> List[Dict[str, Any]]:
+        """Analyze YAML file for quality and Ansible-specific issues."""
+        issues = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            lines = content.split('\n')
+            is_ansible = self._is_ansible_file(file_path, content)
+            
+            for i, line in enumerate(lines, 1):
+                # Basic YAML quality checks
+                
+                # Check for tabs (YAML should use spaces)
+                if '\t' in line:
+                    issues.append({
+                        'category': 'quality',
+                        'type': 'yaml_tabs',
+                        'severity': 'medium',
+                        'description': 'YAML files should use spaces, not tabs for indentation',
+                        'line': i,
+                        'code': line.rstrip(),
+                        'tool': 'yaml_analysis'
+                    })
+                
+                # Check for trailing whitespace
+                if line.rstrip() != line and line.strip():
+                    issues.append({
+                        'category': 'quality',
+                        'type': 'trailing_whitespace',
+                        'severity': 'low',
+                        'description': 'Remove trailing whitespace',
+                        'line': i,
+                        'code': line.rstrip(),
+                        'tool': 'yaml_analysis'
+                    })
+                
+                # Check for inconsistent indentation (not multiple of 2)
+                if line.strip() and line.startswith(' '):
+                    indent_level = len(line) - len(line.lstrip())
+                    if indent_level % 2 != 0:
+                        issues.append({
+                            'category': 'quality',
+                            'type': 'inconsistent_indentation',
+                            'severity': 'medium',
+                            'description': 'YAML indentation should be consistent (multiples of 2 spaces)',
+                            'line': i,
+                            'code': line.rstrip(),
+                            'tool': 'yaml_analysis'
+                        })
+                
+                # Ansible-specific quality checks
+                if is_ansible:
+                    issues.extend(self._analyze_ansible_quality_line(line, i))
+            
+            # Check overall YAML structure
+            if is_ansible:
+                issues.extend(self._analyze_ansible_structure(content, file_path))
+            
+        except Exception as e:
+            self.logger.warning(f"YAML quality analysis failed for {file_path}: {e}")
+        
+        return issues
+    
+    def _analyze_yaml_performance(self, file_path: str) -> List[Dict[str, Any]]:
+        """Analyze YAML file for performance issues."""
+        issues = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            is_ansible = self._is_ansible_file(file_path, content)
+            
+            if is_ansible:
+                lines = content.split('\n')
+                
+                for i, line in enumerate(lines, 1):
+                    # Check for inefficient Ansible patterns
+                    
+                    # Using shell/command when modules exist
+                    if re.search(r'shell:|command:', line):
+                        if any(cmd in line.lower() for cmd in ['apt ', 'yum ', 'pip ', 'git clone', 'systemctl']):
+                            issues.append({
+                                'category': 'performance',
+                                'type': 'ansible_inefficient_module',
+                                'severity': 'medium',
+                                'description': 'Consider using specific Ansible modules instead of shell/command',
+                                'line': i,
+                                'code': line.strip(),
+                                'tool': 'ansible_analysis'
+                            })
+                    
+                    # Missing when conditions for optimization
+                    if 'register:' in line and i < len(lines) - 5:
+                        next_lines = lines[i:i+5]
+                        if not any('when:' in next_line for next_line in next_lines):
+                            issues.append({
+                                'category': 'performance',
+                                'type': 'ansible_missing_when',
+                                'severity': 'low',
+                                'description': 'Consider adding when conditions to skip unnecessary tasks',
+                                'line': i,
+                                'code': line.strip(),
+                                'tool': 'ansible_analysis'
+                            })
+                    
+                    # Inefficient loops
+                    if 'with_items:' in line:
+                        issues.append({
+                            'category': 'performance',
+                            'type': 'ansible_deprecated_loop',
+                            'severity': 'medium',
+                            'description': 'with_items is deprecated, use loop instead',
+                            'line': i,
+                            'code': line.strip(),
+                            'tool': 'ansible_analysis'
+                        })
+        
+        except Exception as e:
+            self.logger.warning(f"YAML performance analysis failed for {file_path}: {e}")
+        
+        return issues
+    
+    def _is_ansible_file(self, file_path: str, content: str) -> bool:
+        """Determine if a YAML file is an Ansible playbook/role."""
+        filename = os.path.basename(file_path).lower()
+        
+        # Check filename patterns
+        ansible_filenames = [
+            'playbook.yml', 'playbook.yaml', 'site.yml', 'site.yaml',
+            'main.yml', 'main.yaml'
+        ]
+        
+        if filename in ansible_filenames:
+            return True
+        
+        # Check for Ansible-specific keywords in content
+        ansible_keywords = [
+            'hosts:', 'tasks:', 'handlers:', 'vars:', 'roles:', 
+            'playbook:', 'become:', 'gather_facts:', 'ansible_',
+            'with_items:', 'when:', 'notify:', 'register:'
+        ]
+        
+        keyword_count = sum(1 for keyword in ansible_keywords if keyword in content)
+        return keyword_count >= 3
+    
+    def _analyze_ansible_quality_line(self, line: str, line_num: int) -> List[Dict[str, Any]]:
+        """Analyze a single line for Ansible-specific quality issues."""
+        issues = []
+        
+        # Check for deprecated syntax
+        deprecated_patterns = [
+            (r'include:', 'Use include_tasks or import_tasks instead of include'),
+            (r'sudo:', 'Use become instead of sudo'),
+            (r'sudo_user:', 'Use become_user instead of sudo_user'),
+            (r'always_run:', 'Use check_mode instead of always_run')
+        ]
+        
+        for pattern, message in deprecated_patterns:
+            if re.search(pattern, line):
+                issues.append({
+                    'category': 'quality',
+                    'type': 'ansible_deprecated_syntax',
+                    'severity': 'medium',
+                    'description': message,
+                    'line': line_num,
+                    'code': line.strip(),
+                    'tool': 'ansible_analysis'
+                })
+        
+        # Check for missing quotes around strings with variables
+        if '{{' in line and '}}' in line:
+            # Variable interpolation should be quoted
+            if re.search(r':\s*{{.*}}', line) and not re.search(r':\s*["\']{{.*}}["\']', line):
+                issues.append({
+                    'category': 'quality',
+                    'type': 'ansible_unquoted_variables',
+                    'severity': 'medium',
+                    'description': 'Variables should be quoted to prevent YAML parsing issues',
+                    'line': line_num,
+                    'code': line.strip(),
+                    'tool': 'ansible_analysis'
+                })
+        
+        # Check for hardcoded values that should be variables
+        if re.search(r'(password|secret|key|token):\s*["\']?[a-zA-Z0-9]+["\']?', line, re.IGNORECASE):
+            issues.append({
+                'category': 'security',
+                'type': 'ansible_hardcoded_secret',
+                'severity': 'high',
+                'description': 'Avoid hardcoding secrets, use vault or variables',
+                'line': line_num,
+                'code': line.strip(),
+                'tool': 'ansible_analysis'
+            })
+        
+        return issues
+    
+    def _analyze_ansible_structure(self, content: str, file_path: str) -> List[Dict[str, Any]]:
+        """Analyze overall Ansible file structure."""
+        issues = []
+        
+        # Check for missing essential sections
+        if 'hosts:' in content and 'tasks:' not in content and 'roles:' not in content:
+            issues.append({
+                'category': 'quality',
+                'type': 'ansible_missing_tasks',
+                'severity': 'high',
+                'description': 'Playbook should have either tasks or roles section',
+                'line': 1,
+                'code': '',
+                'tool': 'ansible_analysis'
+            })
+        
+        # Check for overly complex playbooks
+        task_count = content.count('- name:')
+        if task_count > 50:
+            issues.append({
+                'category': 'quality',
+                'type': 'ansible_complex_playbook',
+                'severity': 'medium',
+                'description': f'Playbook has {task_count} tasks, consider breaking into roles',
+                'line': 1,
+                'code': '',
+                'tool': 'ansible_analysis'
+            })
+        
+        # Check for missing documentation
+        if '- name:' in content and 'description:' not in content and '# ' not in content:
+            issues.append({
+                'category': 'quality',
+                'type': 'ansible_missing_documentation',
+                'severity': 'low',
+                'description': 'Consider adding comments or description for better maintainability',
+                'line': 1,
+                'code': '',
+                'tool': 'ansible_analysis'
+            })
         
         return issues
     
