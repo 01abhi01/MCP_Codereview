@@ -8,16 +8,19 @@ with dynamic repository discovery and multi-language support.
 import asyncio
 import logging
 from typing import Any, Sequence
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp.server import Server
 from mcp import Resource, Tool
 from mcp.types import TextContent, ImageContent, EmbeddedResource
 
-from .utils import Config, setup_logging
-from .core.github_client import GitHubClient
-from .core.repository_manager import RepositoryManager
-from .core.analyzer import CodeAnalyzer
-from .tools import GitHubCodeReviewTools
+from utils import Config, setup_logging
+from core.github_client import GitHubClient
+from core.repository_manager import RepositoryManager
+from core.analyzer import CodeAnalyzer
+from tools import GitHubCodeReviewTools
 
 
 class DynamicGitHubCodeReviewServer:
